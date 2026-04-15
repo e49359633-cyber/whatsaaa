@@ -1,0 +1,23 @@
+# Данные бота
+bot_data.json
+bot_database.db
+
+# Логи
+*.log
+stand_log.txt
+stood_log.txt
+failed_log.txt
+
+# Переменные окружения
+.env
+
+# Pyrogram сессия
+*.session
+userbot_session.session
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
