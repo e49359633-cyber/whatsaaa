@@ -1,4 +1,6 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import logging
 import json
 import re
@@ -20,15 +22,30 @@ from aiogram.types import (
     FSInputFile
 )
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp_socks import ProxyConnector
+try:
+    from aiohttp_socks import ProxyConnector
+except ImportError:
+    ProxyConnector = None
+try:
+    from pyrogram import Client as PyroClient
+except ImportError:
+    PyroClient = None
 
 # ============================================================================
 # КОНФИГУРАЦИЯ
 # ============================================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8756393401:AAGq-Nki_ZGXVAjeE7CrYChxdFaP7O3RGAU")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN_2 = os.getenv("BOT_TOKEN_2", "")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@morphine_lz")
-GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID", "-1003696334786")  # ID группы для команды /number
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID", "")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+TARGET_BOTS = [x.strip() for x in os.getenv("TARGET_BOTS", "KosmicheskiyAvtoVbiv_bot").split(",") if x.strip()]
+userbot: 'PyroClient | None' = None  # Глобальный клиент userbot
+bot1_instance: 'Bot | None' = None  # Ссылка на @spiredteambot для пересылки ответов клиентам
+# Маппинг номер → user_id клиента (для пересылки ответов из тест-бота)
+pending_relay: dict = {}  # {"77478754432": 123456789}
 DATA_FILE = "bot_data.json"
 LOG_FILE = "stand_log.txt"
 STOOD_LOG_FILE = "stood_log.txt"    # Отстояли
@@ -730,8 +747,83 @@ async def tariff_selected(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+async def _get_last_msg_id(target_bot: str) -> int:
+    """Получить ID последнего сообщения в чате"""
+    async for msg in userbot.get_chat_history(target_bot, limit=1):
+        return msg.id
+    return 0
+
+async def _wait_bot_reply(target_bot: str, after_id: int, timeout: int = 15):
+    """Ждём новое входящее сообщение с ID > after_id"""
+    for _ in range(timeout):
+        await asyncio.sleep(1)
+        async for msg in userbot.get_chat_history(target_bot, limit=3):
+            if msg.id > after_id and not msg.outgoing:
+                return msg
+    return None
+
+async def auto_submit_to_bot(target_bot: str, phone_number: str) -> str:
+    """Полная автоматизация сдачи номера в другой бот:
+    /start → нажать 'menu:submit' → номер телефона → нажать 'user:tariff:2'
+    """
+    global userbot
+    
+    # 1. /start
+    last_id = await _get_last_msg_id(target_bot)
+    await userbot.send_message(target_bot, "/start")
+    logger.info(f"[auto] /start → @{target_bot}")
+    reply = await _wait_bot_reply(target_bot, last_id, 10)
+    if not reply:
+        return "⚠️ Бот не ответил на /start"
+    logger.info(f"[auto] Ответ на /start (msg_id={reply.id})")
+    
+    # 2. Нажимаем "Сдать номер" (callback_data='menu:submit')
+    await asyncio.sleep(1)
+    try:
+        await userbot.request_callback_answer(
+            chat_id=target_bot,
+            message_id=reply.id,
+            callback_data="menu:submit"
+        )
+        logger.info(f"[auto] Нажата 'menu:submit'")
+    except Exception as e:
+        logger.warning(f"[auto] menu:submit: {e}")
+    
+    # Ждём "Выберите тариф:" (новое сообщение)
+    reply2 = await _wait_bot_reply(target_bot, reply.id, 10)
+    if not reply2:
+        return "⚠️ Бот не показал тарифы"
+    logger.info(f"[auto] Ответ: {(reply2.text or '')[:50]} (msg_id={reply2.id})")
+    
+    # 3. Нажимаем тариф $3.0 (callback_data='user:tariff:3')
+    await asyncio.sleep(1)
+    try:
+        await userbot.request_callback_answer(
+            chat_id=target_bot,
+            message_id=reply2.id,
+            callback_data="user:tariff:3"
+        )
+        logger.info(f"[auto] Нажата 'user:tariff:3' ($3.0)")
+    except Exception as e:
+        logger.warning(f"[auto] user:tariff:3: {e}")
+    
+    # Бот просит ввести номер
+    await asyncio.sleep(3)
+    
+    # 4. Отправляем номер телефона
+    last_id = await _get_last_msg_id(target_bot)
+    await userbot.send_message(target_bot, phone_number)
+    logger.info(f"[auto] {phone_number} → @{target_bot}")
+    
+    # Ждём финальный ответ
+    final = await _wait_bot_reply(target_bot, last_id, 15)
+    if final and final.text:
+        logger.info(f"[auto] ✅ Финал: {(final.text or '')[:50]}")
+        return f"✅ Номер сдан в @{target_bot}\n\n{final.text[:3000]}"
+    return f"✅ Номер {phone_number} отправлен в @{target_bot}"
+
 @router.message(StateFilter(PhoneSubmissionStates.waiting_for_phone))
-async def phone_number_received(message: Message, state: FSMContext):
+async def phone_number_received(message: Message, state: FSMContext, bot: Bot):
     """Обработчик ввода номера телефона"""
     phone_input = message.text.strip()
     
@@ -743,17 +835,20 @@ async def phone_number_received(message: Message, state: FSMContext):
         return
     
     # Проверка на дубликат — номер уже в очереди
-    data = load_data()
-    for s in data["submissions"]:
-        if s["phone_number"] == phone_number and s["status"] in ["pending", "code_sent", "standing"]:
-            await message.answer(
-                f"{E_ERROR} Номер {phone_number} уже в очереди!\n\n"
-                f"📊 Статус: {STATUS_LABELS.get(s['status'], s['status'])}",
-                reply_markup=get_main_menu_keyboard(message.from_user.id),
-                parse_mode="HTML"
-            )
-            await state.clear()
-            return
+    # Пропускаем для userbot (авто-сдача из другого бота)
+    userbot_id = 8739173913  # @Bombai999
+    if message.from_user.id != userbot_id:
+        data = load_data()
+        for s in data["submissions"]:
+            if s["phone_number"] == phone_number and s["status"] in ["pending", "code_sent", "standing"]:
+                await message.answer(
+                    f"{E_ERROR} Номер {phone_number} уже в очереди!\n\n"
+                    f"📊 Статус: {STATUS_LABELS.get(s['status'], s['status'])}",
+                    reply_markup=get_main_menu_keyboard(message.from_user.id),
+                    parse_mode="HTML"
+                )
+                await state.clear()
+                return
     
     user_data = await state.get_data()
     tariff = user_data.get("selected_tariff", "Неизвестный")
@@ -773,6 +868,30 @@ async def phone_number_received(message: Message, state: FSMContext):
             reply_markup=get_main_menu_keyboard(message.from_user.id),
             parse_mode="HTML"
         )
+        
+        # Авто-сдача ТОЛЬКО из @spiredteambot (бот 1 — клиенты)
+        bot_info = await bot.me()
+        if userbot and TARGET_BOTS and bot_info.id == int(BOT_TOKEN.split(":")[0]):
+            # Сохраняем маппинг номер → клиент для пересылки ответов
+            clean_num = phone_number.replace("+", "")
+            pending_relay[clean_num] = message.from_user.id
+            logger.info(f"Relay: {clean_num} → user {message.from_user.id}")
+            
+            for target_bot in TARGET_BOTS:
+                try:
+                    result = await auto_submit_to_bot(target_bot, phone_number)
+                    logger.info(f"Авто-сдача {phone_number} в @{target_bot}: {result[:100]}")
+                except Exception as e:
+                    logger.error(f"Ошибка авто-сдачи в @{target_bot}: {e}")
+            
+            # Уведомляем клиента
+            await message.answer(
+                f"✅ Ваш номер взяли в работу!\n"
+                f"📱 Номер: {phone_number}\n"
+                f"⏳ Ожидайте код...",
+                reply_markup=get_main_menu_keyboard(message.from_user.id),
+                parse_mode="HTML"
+            )
     else:
         await message.answer(
             f"{E_ERROR} Произошла ошибка при сохранении номера. Попробуйте позже.",
@@ -1476,26 +1595,105 @@ async def admins_list_command(message: Message):
     await message.answer(text)
 
 # ----------------------------------------------------------------------------
-# Команда /number для группы
+# Команда /report — отчёт по пользователям (минуты отстоя)
+# ----------------------------------------------------------------------------
+
+@router.message(Command("report"))
+async def report_command(message: Message, bot: Bot):
+    """Отчёт: пользователь → номера → сколько минут отстояли"""
+    user_username = message.from_user.username or ""
+    if not is_super_admin(username=user_username) and not is_bot_admin(message.from_user.id):
+        await message.answer("⚠️ Нет прав!")
+        return
+    
+    data = load_data()
+    
+    # Группируем по user_id
+    users = {}
+    for sub in data["submissions"]:
+        uid = sub["user_id"]
+        if uid not in users:
+            users[uid] = {"phones": [], "total_minutes": 0}
+        
+        phone = sub["phone_number"]
+        status = sub["status"]
+        minutes = 0
+        
+        # Считаем минуты для отстоявших и стоящих
+        if status == "done" and sub.get("stood_at") and sub.get("done_at"):
+            try:
+                stood = datetime.strptime(sub["stood_at"], "%Y-%m-%d %H:%M:%S")
+                done = datetime.strptime(sub["done_at"], "%Y-%m-%d %H:%M:%S")
+                minutes = int((done - stood).total_seconds() / 60)
+            except:
+                pass
+        elif status == "standing" and sub.get("stood_at"):
+            try:
+                stood = datetime.strptime(sub["stood_at"], "%Y-%m-%d %H:%M:%S")
+                minutes = int((datetime.now() - stood).total_seconds() / 60)
+            except:
+                pass
+        elif status == "slet" and sub.get("stood_at") and sub.get("slet_at"):
+            try:
+                stood = datetime.strptime(sub["stood_at"], "%Y-%m-%d %H:%M:%S")
+                slet = datetime.strptime(sub["slet_at"], "%Y-%m-%d %H:%M:%S")
+                minutes = int((slet - stood).total_seconds() / 60)
+            except:
+                pass
+        
+        status_emoji = {"pending": "⏳", "code_sent": "📷", "standing": "⏱", "done": "✅", "slet": "❌", "error": "⚠️"}.get(status, "❓")
+        users[uid]["phones"].append({"phone": phone, "status": status_emoji, "minutes": minutes, "tariff": sub.get("tariff", "")})
+        users[uid]["total_minutes"] += minutes
+    
+    if not users:
+        await message.answer("📋 Нет данных для отчёта.")
+        return
+    
+    # Сортируем по общим минутам (больше → выше)
+    sorted_users = sorted(users.items(), key=lambda x: x[1]["total_minutes"], reverse=True)
+    
+    text = "📊 <b>Отчёт по пользователям</b>\n\n"
+    
+    for uid, info in sorted_users:
+        total = info["total_minutes"]
+        text += f"👤 <code>{uid}</code> — <b>{total} мин</b>\n"
+        for p in info["phones"]:
+            line = f"  {p['status']} {p['phone']}"
+            if p["minutes"] > 0:
+                line += f" ({p['minutes']} мин)"
+            text += line + "\n"
+        text += "\n"
+    
+    # Общая сумма
+    grand_total = sum(info["total_minutes"] for _, info in sorted_users)
+    text += f"📈 <b>Всего: {grand_total} мин</b>"
+    
+    # Разбиваем на части если длинный
+    if len(text) > 4000:
+        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        for part in parts:
+            await message.answer(part, parse_mode="HTML")
+    else:
+        await message.answer(text, parse_mode="HTML")
+
+# ----------------------------------------------------------------------------
+# Команда /number — взять номер из очереди
 # ----------------------------------------------------------------------------
 
 @router.message(Command("number"))
 async def get_number_command(message: Message, bot: Bot):
-    """Обработчик команды /number для просмотра следующего номера из очереди в группе"""
+    """Обработчик команды /number — только в тест-боте"""
     
-    # Проверяем, что команда вызвана в группе
-    if message.chat.type not in ["group", "supergroup"]:
-        await message.answer("⚠️ Эта команда работает только в группах!")
-        return
-    
-    # Проверяем, что это разрешённая группа
-    if not is_allowed_group(message.chat.id):
+    # Только тест-бот (bot2)
+    bot_info = await bot.me()
+    if bot_info.id != int(BOT_TOKEN_2.split(":")[0]):
+        await message.answer("⚠️ Эта команда работает только в тест-боте!")
         return
     
     # Проверяем, что пользователь — админ бота или суперадмин
     user_username = message.from_user.username or ""
     if not is_super_admin(username=user_username) and not is_bot_admin(message.from_user.id):
-        await message.answer("⚠️ У вас нет прав! Попросите суперадмина выдать вам доступ через /giveadmin")
+        await message.answer("⚠️ У вас нет прав!")
         return
     
     # Получаем следующий номер из очереди
@@ -1527,7 +1725,6 @@ async def get_number_command(message: Message, bot: Bot):
             f"📅 Добавлен: {next_number['created_at']}"
         )
         
-        # Инлайн-кнопки: Отправить код, Скип, Ошибка
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Отправить код", callback_data=f"num_sendcode_{sub_id}"),
@@ -1539,18 +1736,8 @@ async def get_number_command(message: Message, bot: Bot):
         await message.answer(response_text, parse_mode="HTML", reply_markup=keyboard)
         logger.info(f"Номер {next_number['phone_number']} показан администратору {message.from_user.id}")
         
-        # Уведомляем клиента, что его номер взяли
-        try:
-            await bot.send_message(
-                chat_id=next_number["user_id"],
-                text=(
-                    f"{E_SUBMIT} Ваш номер взяли! Ожидайте код.\n\n"
-                    f"📱 Номер: {next_number['phone_number']}"
-                ),
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка уведомления клиента о взятии номера: {e}")
+        # Логируем (клиенту не отправляем — он узнает когда придёт код)
+        logger.info(f"Номер {next_number['phone_number']} взят в работу")
         
     except Exception as e:
         logger.error(f"Ошибка при получении номера: {e}")
@@ -1599,13 +1786,14 @@ async def admin_image_received(message: Message, state: FSMContext, bot: Bot):
     
     if sub:
         photo = message.photo[-1]
+        # Отправляем клиенту через @spiredteambot (bot1)
+        notify_bot = bot1_instance or bot
         try:
-            await bot.send_photo(
+            await notify_bot.send_photo(
                 chat_id=sub["user_id"],
                 photo=photo.file_id,
                 caption=(
-                    f"📱 Код для номера {sub['phone_number']}\n"
-                    f"💳 Тариф: {sub['tariff']}"
+                    f"📱 Код для номера {sub['phone_number']}"
                 )
             )
             
@@ -1692,19 +1880,8 @@ async def auto_stand_check(sub_id: int, bot: Bot, stand_minutes: int):
             
             write_stand_log(sub["phone_number"], sub["stood_at"], now, "отстоял")
             
-            # Уведомляем пользователя
-            try:
-                await bot.send_message(
-                    chat_id=sub["user_id"],
-                    text=(
-                        f"{E_OK} Ваш номер отстоял {stand_minutes} минут!\n\n"
-                        f"📱 Номер: {sub['phone_number']}\n"
-                        f"💳 Тариф: {sub['tariff']}"
-                    ),
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Ошибка уведомления пользователя об отстое: {e}")
+            # Не уведомляем клиента об отстое
+            logger.info(f"Номер {sub['phone_number']} отстоял (клиент не уведомлён)")
             
             logger.info(f"Номер {sub['phone_number']} отстоял {stand_minutes} минут")
             break
@@ -1730,15 +1907,15 @@ async def result_ok_handler(callback: CallbackQuery, bot: Bot):
         # Определяем время отстоя по тарифу
         stand_minutes = TARIFF_STAND_MINUTES.get(sub["tariff"], STAND_TIME_MINUTES)
         
-        # Уведомляем пользователя
+        # Уведомляем пользователя через @spiredteambot
+        notify_bot = bot1_instance or bot
         try:
-            await bot.send_message(
+            await notify_bot.send_message(
                 chat_id=sub["user_id"],
                 text=(
-                    f"{E_OK} Ваш номер встал!\n\n"
+                    f"✅ Номер встал!\n\n"
                     f"📱 Номер: {sub['phone_number']}\n"
-                    f"💳 Тариф: {sub['tariff']}\n"
-                    f"⏱ Ожидайте {stand_minutes} минут для отстоя."
+                    f"⏱ Отстой {stand_minutes} мин."
                 ),
                 parse_mode="HTML"
             )
@@ -1776,19 +1953,20 @@ async def result_error_handler(callback: CallbackQuery, bot: Bot):
     sub = update_submission_status(sub_id, "error")
     
     if sub:
-        # Уведомляем пользователя
+        # Уведомляем клиента через @spiredteambot
+        notify_bot = bot1_instance or bot
         try:
-            await bot.send_message(
+            await notify_bot.send_message(
                 chat_id=sub["user_id"],
                 text=(
-                    f"{E_ERROR} Ваш номер — ошибка!\n\n"
+                    f"❌ Ошибка с номером!\n\n"
                     f"📱 Номер: {sub['phone_number']}\n"
                     f"Поставьте заново."
                 ),
                 parse_mode="HTML"
             )
         except Exception as e:
-            logger.error(f"Ошибка уведомления пользователя: {e}")
+            logger.error(f"Ошибка уведомления: {e}")
         
         await callback.message.edit_text(
             f"{E_ERROR} Ошибка с номером!\n\n"
@@ -1814,18 +1992,19 @@ async def result_retry_handler(callback: CallbackQuery, state: FSMContext, bot: 
             break
     
     if sub:
-        # Уведомляем пользователя подождать
+        # Уведомляем клиента через @spiredteambot
+        notify_bot = bot1_instance or bot
         try:
-            await bot.send_message(
+            await notify_bot.send_message(
                 chat_id=sub["user_id"],
                 text=(
-                    f"{E_RETRY} Подождите код в течение 1 минуты.\n\n"
+                    f"🔄 Подождите код в течение 1 минуты.\n\n"
                     f"📱 Номер: {sub['phone_number']}"
                 ),
                 parse_mode="HTML"
             )
         except Exception as e:
-            logger.error(f"Ошибка уведомления пользователя: {e}")
+            logger.error(f"Ошибка уведомления: {e}")
         
         # Просим админа отправить новое фото
         await state.update_data(sub_id=sub_id)
@@ -1864,19 +2043,8 @@ async def result_slet_handler(callback: CallbackQuery, bot: Bot):
     if sub:
         save_data(data)
         
-        # Уведомляем клиента
-        try:
-            await bot.send_message(
-                chat_id=sub["user_id"],
-                text=(
-                    f"{E_SLET} Ваш номер — слет!\n\n"
-                    f"📱 Номер: {sub['phone_number']}\n"
-                    f"Поставьте заново."
-                ),
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка уведомления клиента о слете: {e}")
+        # Не уведомляем клиента о слете
+        logger.info(f"Номер {sub['phone_number']} — слет (клиент не уведомлён)")
         
         await callback.message.edit_text(
             f"{E_SLET} Номер слетел!\n\n"
@@ -1926,8 +2094,9 @@ async def sms_text_received(message: Message, state: FSMContext, bot: Bot):
     phone = sms_data.get("sms_phone")
     msg_text = message.text.strip()
     
+    notify_bot = bot1_instance or bot
     try:
-        await bot.send_message(
+        await notify_bot.send_message(
             chat_id=user_id,
             text=f"💬 Сообщение от админа:\n\n{msg_text}"
         )
@@ -2159,6 +2328,62 @@ async def num_error_handler(callback: CallbackQuery, bot: Bot):
     await callback.answer()
 
 # ----------------------------------------------------------------------------
+# Кнопка "Сдать в другой бот" — отправка номера через userbot
+# ----------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("num_fwd_"))
+async def num_forward_handler(callback: CallbackQuery, bot: Bot):
+    """Отправить номер в конкретный бот через userbot (Pyrogram)"""
+    global userbot
+    
+    if not PyroClient:
+        await callback.answer("❌ Pyrogram не установлен!")
+        return
+    
+    if not userbot:
+        await callback.answer("❌ Userbot не авторизован! Запустите auth.py")
+        return
+    
+    # Формат: num_fwd_{botname}_{sub_id}
+    parts = callback.data.split("_")
+    sub_id = int(parts[-1])
+    target_bot = "_".join(parts[2:-1])  # botname может содержать _
+    
+    data = load_data()
+    sub = None
+    for s in data["submissions"]:
+        if s["id"] == sub_id:
+            sub = s
+            break
+    
+    if not sub:
+        await callback.message.edit_text("❌ Номер не найден")
+        await callback.answer()
+        return
+    
+    phone = sub["phone_number"]
+    
+    await callback.message.edit_text(
+        f"📤 Отправляю <code>{phone}</code> в @{target_bot}...\n\n"
+        f"⏳ Ожидание ответа...",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+    
+    try:
+        result = await auto_submit_to_bot(target_bot, phone)
+        await callback.message.edit_text(
+            f"📩 @{target_bot} — <code>{phone}</code>\n\n{result[:3000]}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка отправки в @{target_bot}: {e}")
+        await callback.message.edit_text(
+            f"❌ Ошибка @{target_bot}:\n{e}",
+            parse_mode="HTML"
+        )
+
+# ----------------------------------------------------------------------------
 # Узнать ID кастомного эмодзи
 # ----------------------------------------------------------------------------
 
@@ -2182,31 +2407,52 @@ async def get_custom_emoji_id(message: Message):
 
 async def main():
     """Главная функция запуска бота"""
+    global userbot
+    
     # Инициализация JSON файла
     init_data()
     
-    # Создание бота и диспетчера (с прокси если указан)
-    proxy_url = os.getenv("PROXY_URL", "")
-    if proxy_url:
-        connector = ProxyConnector.from_url(proxy_url)
-        session = AiohttpSession(connector=connector)
-        bot = Bot(token=BOT_TOKEN, session=session)
-        logger.info(f"Бот запущен через прокси: {proxy_url}")
+    # Запуск userbot (Pyrogram) если есть сессия
+    session_file = "userbot_session.session"
+    if PyroClient and os.path.exists(session_file):
+        try:
+            userbot = PyroClient(
+                "userbot_session",
+                api_id=API_ID,
+                api_hash=API_HASH,
+            )
+            await userbot.start()
+            me = await userbot.get_me()
+            logger.info(f"Userbot запущен: @{me.username or me.first_name} (ID: {me.id})")
+        except Exception as e:
+            logger.warning(f"Userbot не запущен: {e}. Кнопка 'Сдать в другой бот' не будет работать.")
+            userbot = None
     else:
-        bot = Bot(token=BOT_TOKEN)
+        if not PyroClient:
+            logger.warning("Pyrogram не установлен — userbot отключён")
+        else:
+            logger.warning(f"Файл сессии {session_file} не найден — userbot отключён. Запустите auth.py")
+    
+    # Создание ботов
+    global bot1_instance
+    bot1 = Bot(token=BOT_TOKEN)    # @spiredteambot
+    bot1_instance = bot1
+    bot2 = Bot(token=BOT_TOKEN_2)  # @jjyjyrgjrebgerbgerogoebot
+    
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
-    
-    # Регистрация роутера
     dp.include_router(router)
     
-    logger.info("Бот запущен")
+    logger.info("Запуск 2 ботов")
     
     # Запуск polling
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await dp.start_polling(bot1, bot2, allowed_updates=dp.resolve_used_update_types())
     finally:
-        await bot.session.close()
+        if userbot:
+            await userbot.stop()
+        await bot1.session.close()
+        await bot2.session.close()
 
 if __name__ == "__main__":
     import asyncio
