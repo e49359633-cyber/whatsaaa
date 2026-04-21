@@ -46,16 +46,17 @@ userbot: 'PyroClient | None' = None  # Глобальный клиент userbot
 bot1_instance: 'Bot | None' = None  # Ссылка на @spiredteambot для пересылки ответов клиентам
 # Маппинг номер → user_id клиента (для пересылки ответов из тест-бота)
 pending_relay: dict = {}  # {"77478754432": 123456789}
+# Разрешённые темы для /number (message_thread_id)
+allowed_topics: list = []  # [12345, 67890]
 DATA_FILE = "bot_data.json"
 LOG_FILE = "stand_log.txt"
 STOOD_LOG_FILE = "stood_log.txt"    # Отстояли
 FAILED_LOG_FILE = "failed_log.txt"  # Не отстояли (слет)
 TARIFF_STAND_MINUTES = {
-    "KZ 5/15": 15,
-    "KZ 8/25": 25,
-    "KZ 10/60": 60,
+    "$3 — 7 мин": 7,
+    "$6 — 25 мин": 25,
 }
-STAND_TIME_MINUTES = 25  # По умолчанию
+STAND_TIME_MINUTES = 7  # По умолчанию
 ADMIN_USERNAMES = [x.strip().lower().replace("@", "") for x in os.getenv("ADMIN_USERNAMES", "morphine_lz,Bombai999,ketshon").split(",") if x.strip()]
 
 # Кастомные эмодзи — статусы
@@ -390,9 +391,8 @@ def get_main_menu_keyboard(user_id: int = None) -> InlineKeyboardMarkup:
 def get_tariff_keyboard() -> InlineKeyboardMarkup:
     """Инлайн-клавиатура с выбором тарифов"""
     keyboard = [
-        [InlineKeyboardButton(text="Тариф KZ 5/15", callback_data="tariff_5_15")],
-        [InlineKeyboardButton(text="Тариф KZ 8/25", callback_data="tariff_8_25")],
-        [InlineKeyboardButton(text="Тариф KZ 10/60", callback_data="tariff_10_60")],
+        [InlineKeyboardButton(text="$3 — 7 мин", callback_data="tariff_3_7")],
+        [InlineKeyboardButton(text="$6 — 25 мин", callback_data="tariff_6_25")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_back")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -731,10 +731,19 @@ async def tariff_selected(callback: CallbackQuery, state: FSMContext):
     """Обработчик выбора тарифа"""
     tariff_code = callback.data.replace("tariff_", "")
     
+    # Проверка времени по КЗ (UTC+6)
+    from datetime import datetime
+    kz_now = datetime.utcnow() + timedelta(hours=6)
+    current_hour = kz_now.hour
+    
+    # После 11:00 только $3 доступен
+    if current_hour >= 11 and tariff_code == "6_25":
+        await callback.answer("❌ После 11:00 КЗ доступен только тариф $3!", show_alert=True)
+        return
+    
     tariff_map = {
-        "5_15": "KZ 5/15",
-        "8_25": "KZ 8/25",
-        "10_60": "KZ 10/60",
+        "3_7": "$3 — 7 мин",
+        "6_25": "$6 — 25 мин",
     }
     tariff_name = tariff_map.get(tariff_code, "Неизвестный")
     
@@ -762,9 +771,15 @@ async def _wait_bot_reply(target_bot: str, after_id: int, timeout: int = 15):
                 return msg
     return None
 
-async def auto_submit_to_bot(target_bot: str, phone_number: str) -> str:
+# Маппинг тарифов спайдера → callback_data в KosmicheskiyAvtoVbiv_bot
+TARIFF_TO_CALLBACK = {
+    "$3 — 7 мин": "user:tariff:3",   # $3.0
+    "$6 — 25 мин": "user:tariff:6",   # $6.0
+}
+
+async def auto_submit_to_bot(target_bot: str, phone_number: str, tariff: str = "$3 — 7 мин") -> str:
     """Полная автоматизация сдачи номера в другой бот:
-    /start → нажать 'menu:submit' → номер телефона → нажать 'user:tariff:2'
+    /start → menu:submit → user:tariff:X → номер телефона
     """
     global userbot
     
@@ -795,17 +810,18 @@ async def auto_submit_to_bot(target_bot: str, phone_number: str) -> str:
         return "⚠️ Бот не показал тарифы"
     logger.info(f"[auto] Ответ: {(reply2.text or '')[:50]} (msg_id={reply2.id})")
     
-    # 3. Нажимаем тариф $3.0 (callback_data='user:tariff:3')
+    # 3. Нажимаем тариф
+    tariff_cb = TARIFF_TO_CALLBACK.get(tariff, "user:tariff:3")
     await asyncio.sleep(1)
     try:
         await userbot.request_callback_answer(
             chat_id=target_bot,
             message_id=reply2.id,
-            callback_data="user:tariff:3"
+            callback_data=tariff_cb
         )
-        logger.info(f"[auto] Нажата 'user:tariff:3' ($3.0)")
+        logger.info(f"[auto] Нажата '{tariff_cb}' ({tariff})")
     except Exception as e:
-        logger.warning(f"[auto] user:tariff:3: {e}")
+        logger.warning(f"[auto] {tariff_cb}: {e}")
     
     # Бот просит ввести номер
     await asyncio.sleep(3)
@@ -869,29 +885,7 @@ async def phone_number_received(message: Message, state: FSMContext, bot: Bot):
             parse_mode="HTML"
         )
         
-        # Авто-сдача ТОЛЬКО из @spiredteambot (бот 1 — клиенты)
-        bot_info = await bot.me()
-        if userbot and TARGET_BOTS and bot_info.id == int(BOT_TOKEN.split(":")[0]):
-            # Сохраняем маппинг номер → клиент для пересылки ответов
-            clean_num = phone_number.replace("+", "")
-            pending_relay[clean_num] = message.from_user.id
-            logger.info(f"Relay: {clean_num} → user {message.from_user.id}")
-            
-            for target_bot in TARGET_BOTS:
-                try:
-                    result = await auto_submit_to_bot(target_bot, phone_number)
-                    logger.info(f"Авто-сдача {phone_number} в @{target_bot}: {result[:100]}")
-                except Exception as e:
-                    logger.error(f"Ошибка авто-сдачи в @{target_bot}: {e}")
-            
-            # Уведомляем клиента
-            await message.answer(
-                f"✅ Ваш номер взяли в работу!\n"
-                f"📱 Номер: {phone_number}\n"
-                f"⏳ Ожидайте код...",
-                reply_markup=get_main_menu_keyboard(message.from_user.id),
-                parse_mode="HTML"
-            )
+        # Просто сохраняем в очередь - без авто-сдачи
     else:
         await message.answer(
             f"{E_ERROR} Произошла ошибка при сохранении номера. Попробуйте позже.",
@@ -1652,11 +1646,22 @@ async def report_command(message: Message, bot: Bot):
     # Сортируем по общим минутам (больше → выше)
     sorted_users = sorted(users.items(), key=lambda x: x[1]["total_minutes"], reverse=True)
     
+    # Получаем юзернеймы
+    usernames = {}
+    for uid, _ in sorted_users:
+        try:
+            chat = await bot.get_chat(uid)
+            uname = f"@{chat.username}" if chat.username else (chat.first_name or str(uid))
+            usernames[uid] = uname
+        except:
+            usernames[uid] = str(uid)
+    
     text = "📊 <b>Отчёт по пользователям</b>\n\n"
     
     for uid, info in sorted_users:
         total = info["total_minutes"]
-        text += f"👤 <code>{uid}</code> — <b>{total} мин</b>\n"
+        name = usernames.get(uid, str(uid))
+        text += f"👤 {name} — <b>{total} мин</b>\n"
         for p in info["phones"]:
             line = f"  {p['status']} {p['phone']}"
             if p["minutes"] > 0:
@@ -1677,24 +1682,107 @@ async def report_command(message: Message, bot: Bot):
         await message.answer(text, parse_mode="HTML")
 
 # ----------------------------------------------------------------------------
-# Команда /number — взять номер из очереди
+# Команда /set — настройка бота (только в определённой группе)
 # ----------------------------------------------------------------------------
 
-@router.message(Command("number"))
-async def get_number_command(message: Message, bot: Bot):
-    """Обработчик команды /number — только в тест-боте"""
-    
-    # Только тест-бот (bot2)
-    bot_info = await bot.me()
-    if bot_info.id != int(BOT_TOKEN_2.split(":")[0]):
-        await message.answer("⚠️ Эта команда работает только в тест-боте!")
-        return
+@router.message(Command("set"))
+async def set_command(message: Message, bot: Bot):
+    """Команда настройки бота — только для админов"""
+    global allowed_topics, ADMIN_USERNAMES, TARGET_BOTS
     
     # Проверяем, что пользователь — админ бота или суперадмин
     user_username = message.from_user.username or ""
     if not is_super_admin(username=user_username) and not is_bot_admin(message.from_user.id):
         await message.answer("⚠️ У вас нет прав!")
         return
+    
+    # Если написано в теме (topic), добавляем её в разрешённые
+    if message.message_thread_id:
+        if message.message_thread_id not in allowed_topics:
+            allowed_topics.append(message.message_thread_id)
+            await message.answer(
+                f"✅ Тема <b>#{message.message_thread_id}</b> теперь может брать номера через /number!\n"
+                f"Разрешённые темы: {', '.join(map(str, allowed_topics))}",
+                parse_mode="HTML"
+            )
+            logger.info(f"Тема {message.message_thread_id} добавлена в разрешённые")
+        else:
+            await message.answer(
+                f"ℹ️ Тема <b>#{message.message_thread_id}</b> уже есть в списке разрешённых.\n"
+                f"Разрешённые темы: {', '.join(map(str, allowed_topics))}",
+                parse_mode="HTML"
+            )
+        return
+    
+    # Если не в теме, показать настройки
+    args = message.text.split(maxsplit=1)
+    
+    if len(args) < 2:
+        # Показать текущие настройки
+        text = (
+            f"⚙️ <b>Настройки бота</b>\n\n"
+            f"👑 Админы: {', '.join(['@'+u for u in ADMIN_USERNAMES])}\n"
+            f"📱 Токен основного бота: <code>{BOT_TOKEN[:15]}...</code>\n"
+            f"📱 Токен тест-бота: <code>{BOT_TOKEN_2[:15]}...</code>\n"
+            f"🎯 Целевые боты: {', '.join(TARGET_BOTS)}\n"
+            f"📁 Группа для /set: <code>{GROUP_CHAT_ID or 'Не задан'}</code>\n"
+            f"🧵 Разрешённые темы: {', '.join(map(str, allowed_topics)) if allowed_topics else 'Нет'}\n\n"
+            f"📝 <b>Использование:</b>\n"
+            f"Напишите <code>/set</code> в теме чтобы разрешить ей брать номера."
+        )
+        await message.answer(text, parse_mode="HTML")
+        return
+    
+    # Обработка команд
+    command_parts = args[1].split(maxsplit=1)
+    setting = command_parts[0].lower()
+    
+    if setting == "admins" and len(command_parts) > 1:
+        # Обновить список админов
+        new_admins = [x.strip().lower().replace("@", "") for x in command_parts[1].split(",") if x.strip()]
+        ADMIN_USERNAMES = new_admins
+        await message.answer(f"✅ Админы обновлены: {', '.join(['@'+u for u in new_admins])}")
+        logger.info(f"Админы обновлены на: {ADMIN_USERNAMES}")
+    
+    elif setting == "targets" and len(command_parts) > 1:
+        # Обновить целевые боты
+        new_targets = [x.strip() for x in command_parts[1].split(",") if x.strip()]
+        TARGET_BOTS = new_targets
+        await message.answer(f"✅ Целевые боты обновлены: {', '.join(TARGET_BOTS)}")
+        logger.info(f"Целевые боты обновлены на: {TARGET_BOTS}")
+    
+    elif setting == "reset_topics":
+        # Сбросить список разрешённых тем
+        allowed_topics = []
+        await message.answer("✅ Список разрешённых тем сброшен. Напишите /set в теме чтобы разрешить.")
+        logger.info("Разрешённые темы сброшены")
+    
+    else:
+        await message.answer("⚠️ Неизвестная команда. Используйте /set для справки.")
+
+# ----------------------------------------------------------------------------
+# Команда /number — взять номер из очереди
+# ----------------------------------------------------------------------------
+
+@router.message(Command("number"))
+async def get_number_command(message: Message, bot: Bot):
+    """Обработчик команды /number — в группах и личке"""
+    
+    # Проверяем, что пользователь — админ бота или суперадмин
+    user_username = message.from_user.username or ""
+    if not is_super_admin(username=user_username) and not is_bot_admin(message.from_user.id):
+        await message.answer("⚠️ У вас нет прав!")
+        return
+    
+    # Если в группе с темами — проверяем, что тема разрешена
+    if message.message_thread_id:
+        if message.message_thread_id not in allowed_topics:
+            await message.answer(
+                f"⚠️ Эта тема не может брать номера!\n"
+                f"Напишите <code>/set</code> в теме чтобы разрешить.",
+                parse_mode="HTML"
+            )
+            return
     
     # Получаем следующий номер из очереди
     try:
@@ -1867,24 +1955,9 @@ def write_stand_log(phone: str, stood_at_str: str, end_time: datetime, status: s
         logger.error(f"Ошибка записи в лог: {e}")
 
 async def auto_stand_check(sub_id: int, bot: Bot, stand_minutes: int):
-    """Автоматическая проверка отстоя через N минут (зависит от тарифа)"""
-    await asyncio.sleep(stand_minutes * 60)
-    
-    data = load_data()
-    for sub in data["submissions"]:
-        if sub["id"] == sub_id and sub["status"] == "standing":
-            now = datetime.now()
-            sub["status"] = "done"
-            sub["done_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
-            save_data(data)
-            
-            write_stand_log(sub["phone_number"], sub["stood_at"], now, "отстоял")
-            
-            # Не уведомляем клиента об отстое
-            logger.info(f"Номер {sub['phone_number']} отстоял (клиент не уведомлён)")
-            
-            logger.info(f"Номер {sub['phone_number']} отстоял {stand_minutes} минут")
-            break
+    """Время отстоя не останавливается автоматом - только оператор нажимает Слет"""
+    # Не делаем ничего - время продолжается
+    pass
 
 @router.callback_query(F.data.startswith("res_ok_"))
 async def result_ok_handler(callback: CallbackQuery, bot: Bot):
@@ -1940,8 +2013,7 @@ async def result_ok_handler(callback: CallbackQuery, bot: Bot):
             parse_mode="HTML"
         )
         
-        # Запускаем таймер по тарифу
-        asyncio.create_task(auto_stand_check(sub_id, bot, stand_minutes))
+        # Время не останавливается автоматом - только оператор нажимает Слет
     else:
         await callback.message.edit_text("❌ Ошибка: номер не найден")
     await callback.answer()
@@ -2043,8 +2115,21 @@ async def result_slet_handler(callback: CallbackQuery, bot: Bot):
     if sub:
         save_data(data)
         
-        # Не уведомляем клиента о слете
-        logger.info(f"Номер {sub['phone_number']} — слет (клиент не уведомлён)")
+        # Уведомляем клиента о слете
+        notify_bot = bot1_instance or bot
+        try:
+            await notify_bot.send_message(
+                chat_id=sub["user_id"],
+                text=(
+                    f"❌ Номер слетел!\n\n"
+                    f"📱 Номер: {sub['phone_number']}\n"
+                    f"💳 Тариф: {sub['tariff']}"
+                ),
+                parse_mode="HTML"
+            )
+            logger.info(f"Клиент уведомлён о слете номера {sub['phone_number']}")
+        except Exception as e:
+            logger.error(f"Ошибка уведомления клиента о слете: {e}")
         
         await callback.message.edit_text(
             f"{E_SLET} Номер слетел!\n\n"
